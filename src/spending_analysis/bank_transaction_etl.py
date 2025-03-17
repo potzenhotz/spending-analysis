@@ -1,10 +1,13 @@
 import logging
-import sys
 import os
+import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 import polars as pl
+from dateutil.relativedelta import relativedelta
+from polars.dataframe import group_by
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -30,6 +33,16 @@ def load_data(file_name: Optional[str]) -> pl.DataFrame:
     return df_raw
 
 
+def calc_previous_month(YEAR_MONTH: str, number_of_month: int = 5) -> list[str]:
+    date_obj = datetime.strptime(YEAR_MONTH, "%Y-%m")
+
+    previous_months = [
+        (date_obj - relativedelta(months=i)).strftime("%Y-%m")
+        for i in range(1, number_of_month + 1)
+    ]
+    return previous_months
+
+
 def calc_monthly_spending(df: pl.DataFrame) -> pl.DataFrame:
     logger.info(f"Using function: {sys._getframe().f_code.co_name}")
     monthly_spending = (
@@ -51,60 +64,116 @@ def calc_monthly_top_spending(df: pl.DataFrame, num_top: int = 10) -> pl.DataFra
     monthly_top_spending = (
         df.filter(pl.col("Betrag") < 0)
         .with_columns(pl.col("Betrag") * -1)
+        .sort(pl.col("Betrag"), descending=True)
+        .with_columns(
+            pl.col("Betrag")
+            .rank(method="dense", descending=True)
+            .over(
+                [
+                    "Analyse-Monat",
+                ]
+            )
+            .alias("Rank")
+        )
+        .filter(pl.col("Rank") <= num_top)
         .select(
             [
                 "Buchungstag",
                 "Beguenstigter/Auftraggeber",
-                "Betrag",
                 "Analyse-Hauptkategorie",
                 "Analyse-Unterkategorie",
+                "Betrag",
+                "Analyse-Monat",
             ]
         )
-        .sort(pl.col("Betrag"), descending=True)
-        .head(num_top)
     )
 
     return monthly_top_spending
 
 
-def calc_category_spending(df: pl.DataFrame) -> pl.DataFrame:
+def calc_top_category(df: pl.DataFrame, num_top: int = 5) -> pl.DataFrame:
     logger.info(f"Using function: {sys._getframe().f_code.co_name}")
-    category_spending = (
+    monthly_top_sub_category = (
         df.filter(pl.col("Betrag") < 0)
         .with_columns(pl.col("Betrag") * -1)
-        .group_by(["Analyse-Monat", "Analyse-Hauptkategorie"])
-        .agg(
+        .sort(pl.col("Betrag"), descending=True)
+        .with_columns(
+            pl.col("Betrag")
+            .rank(method="dense", descending=True)
+            .over(
+                [
+                    "Analyse-Monat",
+                    "Analyse-Hauptkategorie",
+                ]
+            )
+            .alias("Rank")
+        )
+        .filter(pl.col("Rank") <= num_top)
+        .select(
             [
-                pl.sum("Betrag").alias("Summe"),
-                pl.count("Betrag").alias("Anzahl Buchungen pro Kategorie"),
+                "Buchungstag",
+                "Beguenstigter/Auftraggeber",
+                "Analyse-Hauptkategorie",
+                "Betrag",
+                "Analyse-Monat",
             ]
         )
-        .sort(["Analyse-Hauptkategorie"])
+        .sort(["Analyse-Hauptkategorie", "Betrag"], descending=[False, True])
+    )
+
+    return monthly_top_sub_category
+
+
+def calc_income_expenses(df: pl.DataFrame) -> pl.DataFrame:
+    logger.info(f"Using function: {sys._getframe().f_code.co_name}")
+    df = df.select(["Analyse-Monat", "Betrag"])
+    expenses = (
+        df.filter(pl.col("Betrag") < 0)
+        .with_columns(pl.col("Betrag") * -1)
+        .group_by("Analyse-Monat")
+        .agg(pl.sum("Betrag").alias("Ausgaben"))
+    )
+    income = (
+        df.filter(pl.col("Betrag") > 0)
+        .group_by("Analyse-Monat")
+        .agg(pl.sum("Betrag").alias("Einnahmen"))
+    )
+    income_expenses = income.join(expenses, on="Analyse-Monat")
+    return income_expenses
+
+
+def _calc_spending_for_specific_column(
+    df: pl.DataFrame, category_column
+) -> pl.DataFrame:
+    logger.info(f"Using function: {sys._getframe().f_code.co_name}")
+    category_spending = (
+        df.select(["Analyse-Monat", category_column, "Betrag"])
+        .filter(pl.col("Betrag") < 0)
+        .with_columns(pl.col("Betrag") * -1)
+        .with_columns(
+            pl.col("Betrag")
+            .sum()
+            .over(["Analyse-Monat", category_column])
+            .alias("Summe")
+        )
+        .with_columns(
+            pl.col("Betrag")
+            .mean()
+            .over(["Analyse-Monat", category_column])
+            .alias("Mittelwert")
+        )
     )
     return category_spending
 
 
+def calc_category_spending(df: pl.DataFrame) -> pl.DataFrame:
+    logger.info(f"Using function: {sys._getframe().f_code.co_name}")
+    return _calc_spending_for_specific_column(df, "Analyse-Hauptkategorie")
+
+
 def calc_sub_category_spending(df: pl.DataFrame) -> pl.DataFrame:
     logger.info(f"Using function: {sys._getframe().f_code.co_name}")
-    sub_category_spending = (
-        df.filter(pl.col("Betrag") < 0)
-        .with_columns(pl.col("Betrag") * -1)
-        .group_by(
-            [
-                "Analyse-Monat",
-                "Analyse-Hauptkategorie",
-                "Analyse-Unterkategorie",
-            ]
-        )
-        .agg(
-            [
-                pl.sum("Betrag").alias("Summe"),
-                pl.count("Betrag").alias("Anzahl Buchungen pro Unterkategorie"),
-            ]
-        )
-        .sort(["Analyse-Hauptkategorie", "Analyse-Unterkategorie"])
-    )
-    return sub_category_spending
+    return _calc_spending_for_specific_column(df, "Analyse-Unterkategorie")
 
 
 def write_data(data_dict, output_dir):

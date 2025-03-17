@@ -1,7 +1,6 @@
 import io
 import logging
 import sys
-from datetime import datetime
 from pathlib import Path
 
 import matplotlib
@@ -9,19 +8,21 @@ import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import polars as pl
 import seaborn as sns
-from dateutil.relativedelta import relativedelta
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.units import cm
 from reportlab.lib.utils import ImageReader
 from reportlab.platypus import (
     Image,
     PageBreak,
+    Paragraph,
     SimpleDocTemplate,
     Spacer,
     Table,
     TableStyle,
 )
+from spending_analysis.bank_transaction_etl import calc_previous_month
 
 matplotlib.use("Agg")  # Use non-interactive backend
 
@@ -31,42 +32,70 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 
-def _calc_previous_month(YEAR_MONTH: str, number_of_month: int = 5) -> list[str]:
-    date_obj = datetime.strptime(YEAR_MONTH, "%Y-%m")
+def plot_income_expenses(df, YEAR_MONTH):
+    logger.info(f"Using function: {sys._getframe().f_code.co_name}")
+    previous_months = calc_previous_month(YEAR_MONTH, 5)
+    months = [YEAR_MONTH] + previous_months
+    df = df.filter(pl.col("Analyse-Monat").is_in(months)).sort(
+        "Analyse-Monat", descending=True
+    )
 
-    previous_months = [
-        (date_obj - relativedelta(months=i)).strftime("%Y-%m")
-        for i in range(1, number_of_month + 1)
-    ]
-    return previous_months
+    unpivot_df = df.unpivot(
+        on=["Einnahmen", "Ausgaben"],
+        index=[
+            "Analyse-Monat",
+        ],
+        variable_name="Metrik",
+        value_name="Wert",
+    ).sort(["Analyse-Monat", "Metrik"], descending=[False, True])
+
+    sns.catplot(
+        data=unpivot_df,
+        x="Analyse-Monat",
+        y="Wert",
+        hue="Metrik",
+        kind="bar",
+        aspect=1.5,
+        palette=[sns.color_palette("Paired")[2], sns.color_palette("Paired")[4]],
+    )
+
+    plt.title("Einnahmen vs. Ausgaben", fontsize=14, fontweight="bold")
+    plt.xlabel("Monat", fontsize=10)
+    plt.ylabel("Betrag (€)", fontsize=10)
+    plt.xticks(rotation=45, ha="right")
+    plt.grid(True, linestyle="--", axis="y", linewidth=0.5, alpha=0.5)
+
+    return save_plot_to_buffer()
 
 
 def plot_balance_over_time(df, YEAR_MONTH):
     logger.info(f"Using function: {sys._getframe().f_code.co_name}")
-    df = df.with_columns(pl.col("Buchungstag").dt.day().alias("Tag"))
+    previous_months = calc_previous_month(YEAR_MONTH, 5)
+    months = [YEAR_MONTH] + previous_months
+    df = (
+        df.with_columns(pl.col("Buchungstag").dt.day().alias("Tag"))
+        .filter(pl.col("Analyse-Monat").is_in(months))
+        .sort("Analyse-Monat", descending=True)
+    )
+    sns.lineplot(
+        x=df["Tag"],
+        y=df["Summe"],
+        hue=df["Analyse-Monat"],
+        style=df["Analyse-Monat"],
+        markers=True,
+        linewidth=1,  # Make it stand out
+    )
+    # Re-plot the highlighted month with a thicker line on top
     df_current_month = df.filter(pl.col("Analyse-Monat") == YEAR_MONTH)
-    previous_months = _calc_previous_month(YEAR_MONTH)
-    dfs_to_plot_prev = [
-        df.filter(pl.col("Analyse-Monat") == month) for month in previous_months
-    ]
     sns.lineplot(
         x=df_current_month["Tag"],
         y=df_current_month["Summe"],
-        marker="o",
-        linestyle="-",
-        linewidth=2,
-        color="#1f77b4",
+        color=sns.color_palette()[0],  # Keep the same color as hue
+        linewidth=3,  # Make it stand out
+        label=None,  # Avoid duplicate legend entry
     )
-    for df_prev in dfs_to_plot_prev:
-        sns.lineplot(
-            x=df_prev["Tag"],
-            y=df_prev["Summe"],
-            marker="o",
-            linestyle="-",
-            linewidth=1,
-            color="grey",
-        )
-    plt.title("Kontostand über die Zeit", fontsize=14, fontweight="bold")
+
+    plt.title("Ausgaben Verlauf", fontsize=14, fontweight="bold")
     plt.xlabel("Datum", fontsize=10)
     plt.ylabel("Ausgaben (€)", fontsize=10)
     plt.xticks(rotation=45)
@@ -81,20 +110,30 @@ def plot_balance_over_time(df, YEAR_MONTH):
 def plot_category_spending(df, cut: bool = False):
     logger.info(f"Using function: {sys._getframe().f_code.co_name}")
 
-    color_values = df["Analyse-Hauptkategorie"].to_list()
-    unique_color_values = list(set(color_values))
-    color_palette = sns.color_palette("viridis", len(unique_color_values))
-    color_mapping = {
-        unique_color_values[i]: color_palette[i]
-        for i in range(len(unique_color_values))
-    }
-    mapped_colors = [color_mapping[val] for val in color_values]
+    unpivot_df = df.unpivot(
+        on=["Summe", "Mittelwert"],
+        index=[
+            "Analyse-Hauptkategorie",
+        ],
+        variable_name="Metrik",
+        value_name="Wert",
+    ).sort(["Wert", "Metrik"], descending=True)
 
-    # plt.figure(figsize=(8, 4))
-    sns.barplot(y=df["Summe"], x=df["Analyse-Hauptkategorie"], palette=mapped_colors)
-    plt.title("Ausgaben nach Hauptkategorie")
-    plt.xlabel("Betrag (€)")
+    sns.catplot(
+        data=unpivot_df,
+        x="Analyse-Hauptkategorie",
+        y="Wert",
+        hue="Metrik",
+        kind="bar",
+        aspect=1.5,
+        palette=[sns.color_palette("Paired")[1], sns.color_palette("Paired")[0]],
+    )
+
+    plt.title("Ausgaben nach Hauptkategorie", fontsize=14, fontweight="bold")
+    plt.xlabel("Kategorie", fontsize=10)
+    plt.ylabel("Betrag (€)", fontsize=10)
     plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
     if cut:
         plt.ylim(0, 750)
 
@@ -104,20 +143,30 @@ def plot_category_spending(df, cut: bool = False):
 def plot_sub_category_spending(df, cut: bool = False):
     logger.info(f"Using function: {sys._getframe().f_code.co_name}")
 
-    color_values = df["Analyse-Hauptkategorie"].to_list()
-    unique_color_values = list(set(color_values))
-    color_palette = sns.color_palette("viridis", len(unique_color_values))
-    color_mapping = {
-        unique_color_values[i]: color_palette[i]
-        for i in range(len(unique_color_values))
-    }
-    mapped_colors = [color_mapping[val] for val in color_values]
+    unpivot_df = df.unpivot(
+        on=["Summe", "Mittelwert"],
+        index=[
+            "Analyse-Unterkategorie",
+        ],
+        variable_name="Metrik",
+        value_name="Wert",
+    ).sort(["Wert", "Metrik"], descending=True)
 
-    # plt.figure(figsize=(8, 6))
-    sns.barplot(y=df["Summe"], x=df["Analyse-Unterkategorie"], palette=mapped_colors)
-    plt.title("Ausgaben nach Unterkategorie")
-    plt.xlabel("Betrag (€)")
+    sns.catplot(
+        data=unpivot_df,
+        x="Analyse-Unterkategorie",
+        y="Wert",
+        hue="Metrik",
+        kind="bar",
+        aspect=1.5,
+        palette=[sns.color_palette("Paired")[1], sns.color_palette("Paired")[0]],
+    )
+
+    plt.title("Ausgaben nach Unterkategorie", fontsize=14, fontweight="bold")
+    plt.xlabel("Unterkategorie", fontsize=10)
+    plt.ylabel("Betrag (€)", fontsize=10)
     plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
     if cut:
         plt.ylim(0, 1000)
     return save_plot_to_buffer()
@@ -162,8 +211,10 @@ def save_df_as_pdf_table(df: pl.DataFrame):
 
 def generate_pdf(
     YEAR_MONTH: str,
+    df_income_expenses: pl.DataFrame,
     df_monthly_spending: pl.DataFrame,
     df_monthly_top_spending: pl.DataFrame,
+    df_monthly_top_category: pl.DataFrame,
     df_category_spending: pl.DataFrame,
     df_sub_category_spending: pl.DataFrame,
 ):
@@ -173,29 +224,49 @@ def generate_pdf(
         pagesize=A4,
     )
     elements = []
-    elements.append(Spacer(1, 1.25 * cm))
+    styles = getSampleStyleSheet()
+    title_style = styles["Title"]
+
+    title = Paragraph(
+        f"Report for {YEAR_MONTH} without 'Bauen / Renovieren'", title_style
+    )
+    elements.append(title)
     # available_width = A4[0] - 2 * cm  # Subtract some margin
 
-    img_1 = Image(plot_balance_over_time(df_monthly_spending, YEAR_MONTH))
-    img_1.drawWidth = 16 * cm  # Explicitly set width
-    img_1.drawHeight = 12 * cm  # Explicitly set height
-    elements.append(img_1)
+    img_ie = Image(plot_income_expenses(df_income_expenses, YEAR_MONTH))
+    img_ie.drawWidth = 15 * cm  # Explicitly set width
+    img_ie.drawHeight = 10 * cm  # Explicitly set height
+    elements.append(img_ie)
+
     elements.append(Spacer(1, 1.25 * cm))
-    table_largest_spendings = save_df_as_pdf_table(df_monthly_top_spending)
-    elements.append(table_largest_spendings)
+
+    img_bot = Image(plot_balance_over_time(df_monthly_spending, YEAR_MONTH))
+    img_bot.drawWidth = 15 * cm  # Explicitly set width
+    img_bot.drawHeight = 10 * cm  # Explicitly set height
+    elements.append(img_bot)
 
     # INFO: Page 2
     elements.append(PageBreak())
 
-    img_2 = Image(plot_category_spending(df_category_spending, cut=True))
-    img_2.drawWidth = 16 * cm  # Explicitly set width
-    img_2.drawHeight = 12 * cm  # Explicitly set height
-    elements.append(img_2)
+    img_cs = Image(plot_category_spending(df_category_spending))
+    img_cs.drawWidth = 15 * cm  # Explicitly set width
+    img_cs.drawHeight = 10 * cm  # Explicitly set height
+    elements.append(img_cs)
 
-    img_3 = Image(plot_sub_category_spending(df_sub_category_spending, cut=True))
-    img_3.drawWidth = 16 * cm  # Explicitly set width
-    img_3.drawHeight = 12 * cm  # Explicitly set height
-    elements.append(img_3)
+    elements.append(Spacer(1, 1 * cm))
+
+    img_scs = Image(plot_sub_category_spending(df_sub_category_spending))
+    img_scs.drawWidth = 15 * cm  # Explicitly set width
+    img_scs.drawHeight = 10 * cm  # Explicitly set height
+    elements.append(img_scs)
+
+    # INFO: Page 3
+    elements.append(PageBreak())
+    table_largest_spendings = save_df_as_pdf_table(df_monthly_top_spending)
+    elements.append(table_largest_spendings)
+    elements.append(Spacer(1, 1 * cm))
+    table_category = save_df_as_pdf_table(df_monthly_top_category)
+    elements.append(table_category)
 
     # INFO: Build pdf
     pdf.build(elements)
