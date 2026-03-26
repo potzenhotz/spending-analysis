@@ -25,6 +25,7 @@ from reportlab.platypus import (
 from spending_analysis.bank_transaction_etl import calc_previous_month
 
 matplotlib.use("Agg")  # Use non-interactive backend
+plt.xkcd()  # Apply XKCD style globally
 
 current_file_path = Path(__file__).parent.resolve()
 
